@@ -18,6 +18,7 @@ jobs:
                -d @- <<EOF
           {
             "title": "${{ github.event.discussion.title }}",
-            "body": "🔗 **This issue was created from a discussion.**\n👉 [View Discussion](${{ github.event.discussion.html_url }})"
+            "body": "🔗 **This issue was created from a discussion.**\n👉 [View Discussion](${{ github.event.discussion.html_url }})",
+            "labels": ["discussion"]
           }
           EOF
