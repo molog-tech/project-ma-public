@@ -1,0 +1,25 @@
+name: Create Issue in Issues Repo
+on:
+  discussion:
+    types: [created]
+
+jobs:
+  create_issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Issue in Issues Repo
+        env:
+          PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          TARGET_REPO: "molog-tech/molog-ewm-v2-issues"  # เปลี่ยนเป็นชื่อ Repo ปลายทาง
+        run: |
+          curl -X POST -H "Authorization: token $PAT" \
+               -H "Accept: application/vnd.github.v3+json" \
+               -H "Content-Type: application/json" \
+               https://api.github.com/repos/$TARGET_REPO/issues \
+               -d @- <<EOF
+          {
+            "title": "${{ github.event.discussion.title }}",
+            "body": "🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}",
+            "labels": ["discussion"]
+          }
+          EOF
