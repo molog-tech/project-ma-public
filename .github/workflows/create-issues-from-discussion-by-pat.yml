@@ -12,7 +12,7 @@ jobs:
         run: echo "CATEGORY=${{ github.event.discussion.category.name }}" >> $GITHUB_ENV
         
       - name: Create Issue in Issues Repo (only bug reports)
-        if: env.CATEGORY == 'bug-report'
+        if: env.CATEGORY == 'Bug Report'
         env:
           PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           TARGET_REPO: "molog-tech/molog-ewm-v2-issues"  # เปลี่ยนเป็นชื่อ Repo ปลายทาง
