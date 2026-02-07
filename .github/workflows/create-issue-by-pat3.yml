@@ -1,0 +1,91 @@
+name: Universal Sync Discussion to Issue
+on:
+  discussion:
+    # เพิ่ม created และ edited เพื่อให้ครอบคลุมทุกจังหวะ
+    types: [created, edited, labeled]
+
+concurrency:
+  group: sync-discussion-${{ github.event.discussion.id }}
+  cancel-in-progress: false
+
+jobs:
+  sync_to_issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process Discussion
+        if: github.event.discussion.category.name == 'Bug Report'
+        env:
+          PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
+        run: |
+          # 1. Jitter เพื่อลดความเร็วในการรันขนาน
+          sleep $(( (RANDOM % 3) + 1 ))
+
+          # 2. ดึงข้อมูลล่าสุดเสมอ (Single Source of Truth)
+          LATEST_DISCUSSION=$(curl -s -H "Authorization: token $PAT" \
+            https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }})
+          
+          LATEST_BODY=$(echo "$LATEST_DISCUSSION" | jq -r '.body')
+          LATEST_LABELS_JSON=$(echo "$LATEST_DISCUSSION" | jq -c '.labels')
+
+          # 3. แยกดึง Label หลักทั้ง 2 กลุ่ม
+          FREQ_LABEL=$(echo "$LATEST_LABELS_JSON" | jq -r '.[] | select(.name | startswith("ความถี่ในการใช้งาน")) | .name' | head -n 1)
+          IMPACT_LABEL=$(echo "$LATEST_LABELS_JSON" | jq -r '.[] | select(.name | startswith("ผลกระทบ")) | .name' | head -n 1)
+          
+          # ตรวจสอบว่าเคยสร้าง Issue ไปหรือยังจาก Link ใน Body
+          ALREADY_CREATED_URL=$(echo "$LATEST_BODY" | grep -o "https://github.com/$TARGET_REPO/issues/[0-9]*" | head -n 1 || true)
+
+          echo "📊 Status Check:"
+          echo "   - Freq: $FREQ_LABEL"
+          echo "   - Impact: $IMPACT_LABEL"
+          echo "   - Existing Issue: $ALREADY_CREATED_URL"
+
+          # --- เงื่อนไขที่ 1: ข้อมูลไม่ครบ ไม่ต้องทำอะไร ---
+          if [[ -z "$FREQ_LABEL" || "$FREQ_LABEL" == "null" ]] || [[ -z "$IMPACT_LABEL" || "$IMPACT_LABEL" == "null" ]]; then
+            echo "⚠️ Aborted: Missing required labels (Frequency or Impact)."
+            exit 0
+          fi
+
+          # เตรียม Labels ที่จะใช้
+          SELECTED_LABELS=$(echo "$LATEST_LABELS_JSON" | jq -c '[
+            .[] | .name | select(startswith("ความถี่ในการใช้งาน") or startswith("ผลกระทบ"))
+          ] + ["discussion"]')
+
+          # --- เงื่อนไขที่ 2 & 3: มีข้อมูลครบแล้ว ---
+          if [[ -z "$ALREADY_CREATED_URL" ]]; then
+            # --- CASE: ยังไม่มี Issue -> สร้างใหม่ ---
+            echo "🚀 Creating New Issue..."
+            TITLE="${{ github.event.discussion.title }}"
+            ISSUE_BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n$LATEST_BODY"
+            
+            PAYLOAD=$(jq -n --arg title "$TITLE" --arg body "$ISSUE_BODY" --argjson labels "$SELECTED_LABELS" \
+              '{title: $title, body: $body, labels: $labels}')
+
+            NEW_ISSUE_RESP=$(curl -s -X POST -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 -H "Content-Type: application/json" \
+                 https://api.github.com/repos/$TARGET_REPO/issues \
+                 -d "$PAYLOAD")
+            
+            NEW_ISSUE_URL=$(echo "$NEW_ISSUE_RESP" | jq -r '.html_url')
+
+            # อัปเดต Body ใน Discussion เพื่อแปะ Link ล็อกไว้
+            NEW_BODY="$LATEST_BODY\n\n---\n📌 **Synced to Issue:** $NEW_ISSUE_URL"
+            curl -s -X PATCH -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }} \
+                 -d "$(jq -n --arg b "$NEW_BODY" '{body: $b}')" > /dev/null
+            echo "🏁 Created: $NEW_ISSUE_URL"
+
+          else
+            # --- CASE: มี Issue แล้ว -> อัปเดต Label ตาม (กรณีแก้ไข Label ทีหลัง) ---
+            echo "🔄 Issue already exists. Updating Labels..."
+            ISSUE_NUMBER=$(echo "$ALREADY_CREATED_URL" | grep -oE "[0-9]+$")
+            
+            # อัปเดตเฉพาะ Labels ใน Issue เดิมให้ตรงกับ Discussion ล่าสุด
+            curl -s -X PATCH -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 https://api.github.com/repos/$TARGET_REPO/issues/$ISSUE_NUMBER \
+                 -d "$(jq -n --argjson l "$SELECTED_LABELS" '{labels: $l}')" > /dev/null
+            echo "🏁 Updated Labels for Issue #$ISSUE_NUMBER"
+          fi
