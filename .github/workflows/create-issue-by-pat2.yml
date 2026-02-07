@@ -1,4 +1,4 @@
-name: Create Issue in Issues Repo
+name: Create Issue from Discussion with Severity Labels
 on:
   discussion:
     types: [created]
@@ -7,24 +7,42 @@ jobs:
   create_issue:
     runs-on: ubuntu-latest
     steps:
-      - name: Check Discussion Category
-        id: check_category
-        run: echo "CATEGORY=${{ github.event.discussion.category.name }}" >> $GITHUB_ENV
-        
-      - name: Create Issue in Issues Repo (only bug reports)
-        if: env.CATEGORY == 'Bug Report'
+      - name: Create Issue in Issues Repo
+        if: github.event.discussion.category.name == 'Bug Report'
         env:
           PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-          TARGET_REPO: "molog-tech/molog-ewm-v2-issues"  # เปลี่ยนเป็นชื่อ Repo ปลายทาง
+          TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
         run: |
+          # 1. ดึงข้อมูล Labels ทั้งหมดจาก Discussion และแปลงเป็น JSON Array
+          # 2. กรองเฉพาะ Labels ที่เรากำหนดไว้
+          SELECTED_LABELS=$(echo '${{ toJson(github.event.discussion.labels) }}' | jq -c '[
+            .[] | .name | select(
+              . == "ความถี่ในการใช้งาน = ปีละครั้ง" or 
+              . == "ความถี่ในการใช้งาน = วันละครั้ง" or 
+              . == "ความถี่ในการใช้งาน = วันละหลายครั้ง" or 
+              . == "ความถี่ในการใช้งาน = สัปดาห์ละครั้ง" or 
+              . == "ความถี่ในการใช้งาน = เดือนละครั้ง" or 
+              . == "ผลกระทบ = Module นั้นทำงานไม่ได้เลยทั้งหมด" or 
+              . == "ผลกระทบ = ทำงานไม่ได้ทุกฟังก์ชั่น" or 
+              . == "ผลกระทบ = ยังมีท่า Workaround"
+            )
+          ] + ["discussion"]') # เพิ่ม label "discussion" เข้าไปด้วยเสมอ
+
+          # 3. เตรียมข้อมูลสำหรับส่งเข้า API (ใช้ jq สร้าง JSON เพื่อกัน Error จากตัวอักษรพิเศษ)
+          TITLE="${{ github.event.discussion.title }}"
+          BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}"
+          
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg body "$BODY" \
+            --argjson labels "$SELECTED_LABELS" \
+            '{title: $title, body: $body, labels: $labels}')
+
+          # 4. ยิง API สร้าง Issue
           curl -X POST -H "Authorization: token $PAT" \
                -H "Accept: application/vnd.github.v3+json" \
                -H "Content-Type: application/json" \
                https://api.github.com/repos/$TARGET_REPO/issues \
-               -d @- <<EOF
-          {
-            "title": "${{ github.event.discussion.title }}",
-            "body": "🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}",
-            "labels": ["discussion"]
-          }
-          EOF
+               -d "$PAYLOAD"
+
+          echo "✅ Issue created with labels: $SELECTED_LABELS"
