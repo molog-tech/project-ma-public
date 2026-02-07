@@ -1,48 +1,69 @@
-name: Create Issue from Discussion with Severity Labels
+name: Sync Discussion to Issue (Strict Validation)
 on:
   discussion:
-    types: [created]
+    types: [created, edited, labeled, unlabeled]
 
 jobs:
-  create_issue:
+  sync_to_issue:
     runs-on: ubuntu-latest
     steps:
-      - name: Create Issue in Issues Repo
+      - name: Process Discussion to Issue
         if: github.event.discussion.category.name == 'Bug Report'
         env:
           PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
         run: |
-          # 1. ดึงข้อมูล Labels ทั้งหมดจาก Discussion และแปลงเป็น JSON Array
-          # 2. กรองเฉพาะ Labels ที่เรากำหนดไว้
-          SELECTED_LABELS=$(echo '${{ toJson(github.event.discussion.labels) }}' | jq -c '[
-            .[] | .name | select(
-              . == "ความถี่ในการใช้งาน = ปีละครั้ง" or 
-              . == "ความถี่ในการใช้งาน = วันละครั้ง" or 
-              . == "ความถี่ในการใช้งาน = วันละหลายครั้ง" or 
-              . == "ความถี่ในการใช้งาน = สัปดาห์ละครั้ง" or 
-              . == "ความถี่ในการใช้งาน = เดือนละครั้ง" or 
-              . == "ผลกระทบ = Module นั้นทำงานไม่ได้เลยทั้งหมด" or 
-              . == "ผลกระทบ = ทำงานไม่ได้ทุกฟังก์ชั่น" or 
-              . == "ผลกระทบ = ยังมีท่า Workaround"
-            )
-          ] + ["discussion"]') # เพิ่ม label "discussion" เข้าไปด้วยเสมอ
-
-          # 3. เตรียมข้อมูลสำหรับส่งเข้า API (ใช้ jq สร้าง JSON เพื่อกัน Error จากตัวอักษรพิเศษ)
-          TITLE="${{ github.event.discussion.title }}"
-          BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}"
+          # 1. ดึง Labels ทั้งหมดมานับจำนวนตัวที่ตรงเงื่อนไข
+          ALL_LABELS_JSON='${{ toJson(github.event.discussion.labels) }}'
           
-          PAYLOAD=$(jq -n \
-            --arg title "$TITLE" \
-            --arg body "$BODY" \
-            --argjson labels "$SELECTED_LABELS" \
-            '{title: $title, body: $body, labels: $labels}')
+          # นับว่ามี Label ที่ขึ้นต้นด้วย "ความถี่ในการใช้งาน" กี่ตัว
+          FREQ_COUNT=$(echo "$ALL_LABELS_JSON" | jq '[.[] | select(.name | startswith("ความถี่ในการใช้งาน"))] | length')
+          
+          # นับว่ามี Label ที่ขึ้นต้นด้วย "ผลกระทบ" กี่ตัว
+          IMPACT_COUNT=$(echo "$ALL_LABELS_JSON" | jq '[.[] | select(.name | startswith("ผลกระทบ"))] | length')
+          
+          # 2. ตรวจสอบว่าเคยสร้างไปหรือยัง (กันสร้างซ้ำ)
+          ALREADY_CREATED=$(echo "${{ github.event.discussion.body }}" | grep -c "$TARGET_REPO/issues/" || true)
 
-          # 4. ยิง API สร้าง Issue
-          curl -X POST -H "Authorization: token $PAT" \
-               -H "Accept: application/vnd.github.v3+json" \
-               -H "Content-Type: application/json" \
-               https://api.github.com/repos/$TARGET_REPO/issues \
-               -d "$PAYLOAD"
+          echo "📊 Status Summary:"
+          echo "   - Frequency Labels found: $FREQ_COUNT"
+          echo "   - Impact Labels found: $IMPACT_COUNT"
+          echo "   - Already Created: $ALREADY_CREATED"
 
-          echo "✅ Issue created with labels: $SELECTED_LABELS"
+          # 3. เงื่อนไขเหล็ก: ต้องมีอย่างน้อยกลุ่มละ 1 อัน และยังไม่เคยสร้าง
+          if [ "$FREQ_COUNT" -gt 0 ] && [ "$IMPACT_COUNT" -gt 0 ] && [ "$ALREADY_CREATED" -eq 0 ]; then
+            echo "✅ All conditions met. Creating Issue..."
+
+            # กรองเอาเฉพาะ Labels ที่เราต้องการส่งไปปลายทาง
+            SELECTED_LABELS=$(echo "$ALL_LABELS_JSON" | jq -c '[
+              .[] | .name | select(
+                startswith("ความถี่ในการใช้งาน") or 
+                startswith("ผลกระทบ")
+              )
+            ] + ["discussion"]')
+
+            TITLE="${{ github.event.discussion.title }}"
+            BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}"
+            
+            PAYLOAD=$(jq -n \
+              --arg title "$TITLE" \
+              --arg body "$BODY" \
+              --argjson labels "$SELECTED_LABELS" \
+              '{title: $title, body: $body, labels: $labels}')
+
+            RESPONSE=$(curl -s -X POST -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 -H "Content-Type: application/json" \
+                 https://api.github.com/repos/$TARGET_REPO/issues \
+                 -d "$PAYLOAD")
+            
+            ISSUE_URL=$(echo "$RESPONSE" | jq -r '.html_url')
+            echo "🚀 Success! Issue created at: $ISSUE_URL"
+          
+          else
+            echo "⚠️ Validation Failed:"
+            [ "$FREQ_COUNT" -eq 0 ] && echo "   - Missing 'ความถี่ในการใช้งาน' label"
+            [ "$IMPACT_COUNT" -eq 0 ] && echo "   - Missing 'ผลกระทบ' label"
+            [ "$ALREADY_CREATED" -ne 0 ] && echo "   - Issue already exists"
+            exit 0
+          fi
