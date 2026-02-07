@@ -1,0 +1,76 @@
+name: Immediate Sync Discussion to Issue
+on:
+  discussion:
+    types: [created, edited, labeled, unlabeled]
+
+concurrency:
+  group: sync-discussion-${{ github.event.discussion.id }}
+  cancel-in-progress: false
+
+jobs:
+  sync_to_issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process Discussion
+        if: github.event.discussion.category.name == 'Bug Report'
+        env:
+          PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
+        run: |
+          sleep $(( (RANDOM % 3) + 1 ))
+
+          # 1. ดึงข้อมูลล่าสุด
+          LATEST_DISCUSSION=$(curl -s -H "Authorization: token $PAT" \
+            https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }})
+          
+          LATEST_BODY=$(echo "$LATEST_DISCUSSION" | jq -r '.body')
+          LATEST_LABELS_JSON=$(echo "$LATEST_DISCUSSION" | jq -c '.labels')
+          TITLE=$(echo "$LATEST_DISCUSSION" | jq -r '.title')
+
+          # 2. เตรียม Selected Labels (ถ้ามี)
+          SELECTED_LABELS=$(echo "$LATEST_LABELS_JSON" | jq -c '[
+            .[] | .name | select(startswith("ความถี่ในการใช้งาน") or startswith("ผลกระทบ"))
+          ] + ["discussion"]')
+
+          # 3. เช็คว่าเคยสร้าง Issue ไปหรือยัง
+          ALREADY_CREATED_URL=$(echo "$LATEST_BODY" | grep -o "https://github.com/$TARGET_REPO/issues/[0-9]*" | head -n 1 || true)
+
+          if [[ -z "$ALREADY_CREATED_URL" ]]; then
+            # --- CASE: สร้างครั้งแรก (ไม่สนว่ามี Label หรือยัง) ---
+            echo "🚀 First time sync. Creating Issue..."
+            
+            ISSUE_BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n$LATEST_BODY"
+            
+            PAYLOAD=$(jq -n --arg title "$TITLE" --arg body "$ISSUE_BODY" --argjson labels "$SELECTED_LABELS" \
+              '{title: $title, body: $body, labels: $labels}')
+
+            NEW_ISSUE_RESP=$(curl -s -X POST -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 -H "Content-Type: application/json" \
+                 https://api.github.com/repos/$TARGET_REPO/issues \
+                 -d "$PAYLOAD")
+            
+            NEW_ISSUE_URL=$(echo "$NEW_ISSUE_RESP" | jq -r '.html_url')
+
+            # แปะ Link กลับไปที่ Discussion เพื่อ "ล็อก"
+            NEW_BODY="$LATEST_BODY\n\n---\n📌 **Synced to Issue:** $NEW_ISSUE_URL"
+            curl -s -X PATCH -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }} \
+                 -d "$(jq -n --arg b "$NEW_BODY" '{body: $b}')" > /dev/null
+            
+            echo "🏁 Created: $NEW_ISSUE_URL"
+
+          else
+            # --- CASE: มี Issue แล้ว -> ตามไปอัปเดต Label และ Title ---
+            echo "🔄 Issue exists. Syncing Latest Data..."
+            ISSUE_NUMBER=$(echo "$ALREADY_CREATED_URL" | grep -oE "[0-9]+$")
+            
+            # อัปเดตทั้ง Title และ Labels เผื่อมีการแก้ไขหัวข้อใน Discussion
+            curl -s -X PATCH -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 https://api.github.com/repos/$TARGET_REPO/issues/$ISSUE_NUMBER \
+                 -d "$(jq -n --arg t "$TITLE" --argjson l "$SELECTED_LABELS" '{title: $t, labels: $l}')" > /dev/null
+            
+            echo "🏁 Synced data for Issue #$ISSUE_NUMBER"
+          fi
