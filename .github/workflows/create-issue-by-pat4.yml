@@ -1,10 +1,9 @@
-name: Universal Sync Discussion to Issue (Fixed Duplicate)
+name: Universal Sync Discussion to Issue (Search & Lock)
 on:
   discussion:
     types: [created, edited, labeled, unlabeled]
 
 concurrency:
-  # บังคับให้รันทีละ 1 Job ต่อ 1 Discussion เท่านั้น
   group: sync-discussion-${{ github.event.discussion.id }}
   cancel-in-progress: false
 
@@ -17,11 +16,12 @@ jobs:
         env:
           PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
+          DISCUSSION_URL: "${{ github.event.discussion.html_url }}"
         run: |
-          # 1. ป้องกันเครื่องรันพร้อมกันแบบเสี้ยววินาที
-          sleep $(( (RANDOM % 3) + 2 ))
+          # 1. รอให้ GitHub Database อัปเดตข้อมูลสักครู่
+          sleep 5
 
-          # 2. ดึงข้อมูลล่าสุดผ่าน API (ตรวจสอบความเป็นจริงปัจจุบัน)
+          # 2. ดึงข้อมูลล่าสุดจาก API
           LATEST_DATA=$(curl -s -H "Authorization: token $PAT" \
             https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }})
           
@@ -29,21 +29,33 @@ jobs:
           LATEST_LABELS_JSON=$(echo "$LATEST_DATA" | jq -c '.labels')
           TITLE=$(echo "$LATEST_DATA" | jq -r '.title')
 
-          # 3. เตรียม Labels ที่ต้องการ Sync
           SELECTED_LABELS=$(echo "$LATEST_LABELS_JSON" | jq -c '[
             .[] | .name | select(startswith("ความถี่ในการใช้งาน") or startswith("ผลกระทบ"))
           ] + ["discussion"]')
 
-          # 4. ค้นหา Issue URL จาก Body (ใช้ Regex ที่แม่นยำขึ้น)
-          ALREADY_CREATED_URL=$(echo "$LATEST_BODY" | grep -o "https://github.com/$TARGET_REPO/issues/[0-9]*" | head -n 1 || true)
+          # 3. --- ระบบค้นหา 2 ชั้น (Double Check) ---
+          
+          # ชั้นที่ 1: เช็คจาก Body ของ Discussion เอง
+          ISSUE_URL=$(echo "$LATEST_BODY" | grep -o "https://github.com/$TARGET_REPO/issues/[0-9]*" | head -n 1 || true)
 
-          echo "🔍 Check Result: URL Found -> '$ALREADY_CREATED_URL'"
-
-          if [ -z "$ALREADY_CREATED_URL" ]; then
-            # --- CASE: ยังไม่มี Issue ใน Body (สร้างใหม่) ---
-            echo "🚀 No link found in body. Creating New Issue..."
+          # ชั้นที่ 2: ถ้าใน Body ไม่มี ให้ไปค้นหาใน Repo Issues ว่ามีใครอ้างถึง Discussion นี้ไหม
+          if [ -z "$ISSUE_URL" ]; then
+            echo "🔍 Issue link not in body, searching in $TARGET_REPO..."
+            SEARCH_QUERY="repo:$TARGET_REPO type:issue \"$DISCUSSION_URL\""
+            # ใช้ GitHub Search API
+            SEARCH_RESULT=$(curl -s -H "Authorization: token $PAT" \
+              -G "https://api.github.com/search/issues" \
+              --data-urlencode "q=$SEARCH_QUERY")
             
-            ISSUE_BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n$LATEST_BODY"
+            ISSUE_URL=$(echo "$SEARCH_RESULT" | jq -r '.items[0].html_url // empty')
+          fi
+
+          # 4. --- เริ่มกระบวนการ Create หรือ Update ---
+
+          if [ -z "$ISSUE_URL" ] || [ "$ISSUE_URL" == "null" ]; then
+            echo "🚀 No existing issue found anywhere. Creating New..."
+            
+            ISSUE_BODY="🔗 **Discussion Link:** $DISCUSSION_URL\n\n$LATEST_BODY"
             PAYLOAD=$(jq -n --arg title "$TITLE" --arg body "$ISSUE_BODY" --argjson labels "$SELECTED_LABELS" \
               '{title: $title, body: $body, labels: $labels}')
 
@@ -52,26 +64,24 @@ jobs:
                  https://api.github.com/repos/$TARGET_REPO/issues \
                  -d "$PAYLOAD")
             
-            NEW_ISSUE_URL=$(echo "$NEW_ISSUE_RESP" | jq -r '.html_url')
+            ISSUE_URL=$(echo "$NEW_ISSUE_RESP" | jq -r '.html_url')
 
-            # --- จุดตัดสินใจ: ต้องอัปเดต Body ของ Discussion ทันทีเพื่อล็อก ---
-            NEW_BODY="$LATEST_BODY\n\n---\n📌 **Synced to Issue:** $NEW_ISSUE_URL"
+            # บันทึกลิงก์กลับไปที่ Discussion ทันที
+            NEW_BODY="$LATEST_BODY\n\n---\n📌 **Synced to Issue:** $ISSUE_URL"
             curl -s -X PATCH -H "Authorization: token $PAT" \
                  -H "Accept: application/vnd.github.v3+json" \
                  https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }} \
                  -d "$(jq -n --arg b "$NEW_BODY" '{body: $b}')" > /dev/null
             
-            echo "🏁 Created and Locked: $NEW_ISSUE_URL"
-
+            echo "✅ Created: $ISSUE_URL"
           else
-            # --- CASE: มี Link ใน Body แล้ว (อัปเดตตัวเดิม) ---
-            echo "🔄 Issue already exists at $ALREADY_CREATED_URL. Updating labels only..."
-            ISSUE_NUMBER=$(echo "$ALREADY_CREATED_URL" | grep -oE "[0-9]+$")
+            echo "🔄 Found existing issue: $ISSUE_URL. Updating..."
+            ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -oE "[0-9]+$")
             
             curl -s -X PATCH -H "Authorization: token $PAT" \
                  -H "Accept: application/vnd.github.v3+json" \
                  https://api.github.com/repos/$TARGET_REPO/issues/$ISSUE_NUMBER \
                  -d "$(jq -n --arg t "$TITLE" --argjson l "$SELECTED_LABELS" '{title: $t, labels: $l}')" > /dev/null
             
-            echo "🏁 Updated labels for Issue #$ISSUE_NUMBER"
+            echo "✅ Updated Issue #$ISSUE_NUMBER"
           fi
