@@ -1,7 +1,12 @@
-name: Sync Discussion to Issue (Strict Validation)
+name: Sync Discussion to Issue (Race Condition Fixed)
 on:
   discussion:
     types: [created, edited, labeled, unlabeled]
+
+# บังคับให้รันทีละ 1 Workflow ต่อ 1 Discussion เท่านั้น
+concurrency:
+  group: sync-discussion-${{ github.event.discussion.id }}
+  cancel-in-progress: false # สำคัญ: ห้ามกดยกเลิกอันก่อนหน้า ให้รันต่อจนจบเพื่อสร้าง Issue ให้เสร็จ
 
 jobs:
   sync_to_issue:
@@ -13,57 +18,56 @@ jobs:
           PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           TARGET_REPO: "molog-tech/molog-ewm-v2-issues"
         run: |
-          # 1. ดึง Labels ทั้งหมดมานับจำนวนตัวที่ตรงเงื่อนไข
-          ALL_LABELS_JSON='${{ toJson(github.event.discussion.labels) }}'
-          
-          # นับว่ามี Label ที่ขึ้นต้นด้วย "ความถี่ในการใช้งาน" กี่ตัว
-          FREQ_COUNT=$(echo "$ALL_LABELS_JSON" | jq '[.[] | select(.name | startswith("ความถี่ในการใช้งาน"))] | length')
-          
-          # นับว่ามี Label ที่ขึ้นต้นด้วย "ผลกระทบ" กี่ตัว
-          IMPACT_COUNT=$(echo "$ALL_LABELS_JSON" | jq '[.[] | select(.name | startswith("ผลกระทบ"))] | length')
-          
-          # 2. ตรวจสอบว่าเคยสร้างไปหรือยัง (กันสร้างซ้ำ)
-          ALREADY_CREATED=$(echo "${{ github.event.discussion.body }}" | grep -c "$TARGET_REPO/issues/" || true)
+          # 1. รอสักครู่เพื่อให้ API ของ GitHub อัปเดตข้อมูลล่าสุด (ป้องกัน Race Condition)
+          sleep 5
 
-          echo "📊 Status Summary:"
-          echo "   - Frequency Labels found: $FREQ_COUNT"
-          echo "   - Impact Labels found: $IMPACT_COUNT"
-          echo "   - Already Created: $ALREADY_CREATED"
+          # 2. ดึงข้อมูลล่าสุดจาก API อีกครั้ง (ไม่เชื่อข้อมูลจาก event อย่างเดียว)
+          # เพื่อดูว่ามีคนอื่นสร้าง Issue ตัดหน้าเราไปหรือยัง
+          LATEST_DISCUSSION=$(curl -s -H "Authorization: token $PAT" \
+            https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }})
+          
+          LATEST_BODY=$(echo "$LATEST_DISCUSSION" | jq -r '.body')
+          LATEST_LABELS_JSON=$(echo "$LATEST_DISCUSSION" | jq -c '.labels')
 
-          # 3. เงื่อนไขเหล็ก: ต้องมีอย่างน้อยกลุ่มละ 1 อัน และยังไม่เคยสร้าง
+          # 3. ตรวจสอบเงื่อนไขความสมบูรณ์
+          FREQ_COUNT=$(echo "$LATEST_LABELS_JSON" | jq '[.[] | select(.name | startswith("ความถี่ในการใช้งาน"))] | length')
+          IMPACT_COUNT=$(echo "$LATEST_LABELS_JSON" | jq '[.[] | select(.name | startswith("ผลกระทบ"))] | length')
+          
+          # เช็คจาก Body ล่าสุดว่ามีลิงก์หรือยัง
+          ALREADY_CREATED=$(echo "$LATEST_BODY" | grep -c "$TARGET_REPO/issues/" || true)
+
+          echo "📊 Current Stats -> Freq: $FREQ_COUNT, Impact: $IMPACT_COUNT, Created: $ALREADY_CREATED"
+
           if [ "$FREQ_COUNT" -gt 0 ] && [ "$IMPACT_COUNT" -gt 0 ] && [ "$ALREADY_CREATED" -eq 0 ]; then
-            echo "✅ All conditions met. Creating Issue..."
+            echo "✅ Valid and Not Duplicate. Creating Issue..."
 
-            # กรองเอาเฉพาะ Labels ที่เราต้องการส่งไปปลายทาง
-            SELECTED_LABELS=$(echo "$ALL_LABELS_JSON" | jq -c '[
-              .[] | .name | select(
-                startswith("ความถี่ในการใช้งาน") or 
-                startswith("ผลกระทบ")
-              )
+            SELECTED_LABELS=$(echo "$LATEST_LABELS_JSON" | jq -c '[
+              .[] | .name | select(startswith("ความถี่ในการใช้งาน") or startswith("ผลกระทบ"))
             ] + ["discussion"]')
 
             TITLE="${{ github.event.discussion.title }}"
-            BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n${{ github.event.discussion.body }}"
+            ISSUE_BODY="🔗 **Discussion Link:** ${{ github.event.discussion.html_url }}\n\n$LATEST_BODY"
             
-            PAYLOAD=$(jq -n \
-              --arg title "$TITLE" \
-              --arg body "$BODY" \
-              --argjson labels "$SELECTED_LABELS" \
+            PAYLOAD=$(jq -n --arg title "$TITLE" --arg body "$ISSUE_BODY" --argjson labels "$SELECTED_LABELS" \
               '{title: $title, body: $body, labels: $labels}')
 
-            RESPONSE=$(curl -s -X POST -H "Authorization: token $PAT" \
+            NEW_ISSUE_RESP=$(curl -s -X POST -H "Authorization: token $PAT" \
                  -H "Accept: application/vnd.github.v3+json" \
                  -H "Content-Type: application/json" \
                  https://api.github.com/repos/$TARGET_REPO/issues \
                  -d "$PAYLOAD")
             
-            ISSUE_URL=$(echo "$RESPONSE" | jq -r '.html_url')
-            echo "🚀 Success! Issue created at: $ISSUE_URL"
-          
+            NEW_ISSUE_URL=$(echo "$NEW_ISSUE_RESP" | jq -r '.html_url')
+
+            # --- จุดสำคัญ: ต้องแปะลิงก์กลับไปที่ Discussion เพื่อล็อกว่า "สร้างแล้ว" ---
+            NEW_BODY="$LATEST_BODY\n\n---\n📌 **Synced to Issue:** $NEW_ISSUE_URL"
+            
+            curl -s -X PATCH -H "Authorization: token $PAT" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 https://api.github.com/repos/${{ github.repository }}/discussions/${{ github.event.discussion.number }} \
+                 -d "$(jq -n --arg b "$NEW_BODY" '{body: $b}')" > /dev/null
+
+            echo "🚀 Success: Created $NEW_ISSUE_URL and locked Discussion."
           else
-            echo "⚠️ Validation Failed:"
-            [ "$FREQ_COUNT" -eq 0 ] && echo "   - Missing 'ความถี่ในการใช้งาน' label"
-            [ "$IMPACT_COUNT" -eq 0 ] && echo "   - Missing 'ผลกระทบ' label"
-            [ "$ALREADY_CREATED" -ne 0 ] && echo "   - Issue already exists"
-            exit 0
+            echo "⚠️ Skipped: Conditions not met or already created."
           fi
